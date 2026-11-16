@@ -1,4 +1,5 @@
 import numpy as np
+from spatialgeometry import Shape
 
 
 class RobotWrapper:
@@ -12,6 +13,7 @@ class RobotWrapper:
         panda_rtb_model,
         q_start: np.ndarray,
         ip_address: str | None = None,
+        shapes: list[Shape] = [],
     ):
         # ip_address is the station's miniPC (the robot server), not the robot;
         # None means the default, 192.168.1.100 or $CSC376_ROBOT_HOST.
@@ -28,7 +30,7 @@ class RobotWrapper:
             from csc376_franky.visualizer import RtbVisualizer
 
             self.visualizer = RtbVisualizer(
-                panda_rtb_model, q_start, real_robot=self.real_robot
+                panda_rtb_model, q_start, real_robot=self.real_robot, shapes=shapes
             )
 
     @property

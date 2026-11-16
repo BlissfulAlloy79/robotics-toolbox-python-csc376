@@ -10,6 +10,7 @@ import roboticstoolbox as rtb
 import spatialgeometry as sg
 import swift
 from spatialmath import SE3
+from spatialgeometry import Shape
 
 # How the Panda that follows the real robot is drawn.
 REAL_ROBOT_COLOR = (0.2, 0.6, 1.0)
@@ -47,6 +48,7 @@ class RtbVisualizer:
         base_pose=None,
         gripper_q=(0.01, 0.01),
         real_robot=None,
+        shapes: list[Shape] = [],
     ):
         """Shows a Panda in Swift, to preview joint trajectories before they run on the robot.
 
@@ -79,6 +81,11 @@ class RtbVisualizer:
         self.env = swift.Swift()
         try:
             self.env.launch()
+
+            # add custom shapes to rendering
+            for shape in shapes:
+                self.env.add_shape(shape)
+
             # Swift leaves a thread waiting on the browser that keeps Python from
             # exiting, so close Swift at exit if stop() was never called (an
             # exception, Ctrl+C). threading's exit hooks run before Python waits
