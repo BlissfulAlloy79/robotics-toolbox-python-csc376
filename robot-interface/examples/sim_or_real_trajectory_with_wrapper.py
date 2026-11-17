@@ -1,7 +1,6 @@
 import numpy as np
 import roboticstoolbox as rtb
 from spatialmath import SE3
-import spatialgeometry as sg
 
 from csc376_franky.motion_generator import RuckigMotionGenerator
 from csc376_franky.robot_wrapper import RobotWrapper
@@ -11,15 +10,12 @@ def main():
     np.set_printoptions(precision=4, suppress=True)
 
     panda_rtb_model = rtb.models.Panda()
-    custom_shape = sg.Sphere(
-        radius=0.05, pose=SE3(0.55, 0.0, 0.02), color=(0.85, 0.85, 0.85, 1.0)
-    )
 
     has_visualizer = True
     run_on_real = False
     q_start = panda_rtb_model.qr
     robot = RobotWrapper(
-        has_visualizer, run_on_real, panda_rtb_model, q_start, shapes=[custom_shape]
+        has_visualizer, run_on_real, panda_rtb_model, q_start
     )  # None: this station's miniPC
     q_start = (
         robot.get_current_joint_positions()
