@@ -20,7 +20,9 @@ and the station's miniPC runs it on the robot.
   kernel, no compiler: it runs on any lab PC.
 * **miniPC**: `server/`, the robot server. It is the only program that talks to the
   robot. It checks every trajectory, runs the joint impedance controller of the
-  old `csc376_franky` at 1 kHz, and sends the robot's state to the GPU PCs.
+  old `csc376_franky` at 1 kHz, and sends the robot's state to the GPU PCs. It can
+  also make the robot follow a velocity that a GPU PC streams to it (see
+  [Velocity control](#velocity-control)).
 
 Both GPU PCs of a station can work at the same time. Each one sees the robot's
 state, so each can plan and preview from where the robot actually is. The robot
@@ -74,6 +76,7 @@ robot.move_gripper(0.0)  # close the gripper
 | `sim_or_real_trajectory.py` | A 10 cm square, in Swift (`simulation = True`) or on the robot |
 | `sim_or_real_trajectory_with_wrapper.py` | The square in Swift, then on the robot, through `RobotWrapper` |
 | `move_home.py` | Moves the robot to libfranka's home pose after you type `yes` (see below) |
+| `velocity_control.py` | Moves the hand 3 cm up under velocity control after you type `yes` (see below) |
 
 `robot.move_home(speed_factor=0.2)` moves the robot the way libfranka's examples do,
 without Ruckig or the toolbox. The miniPC runs libfranka's example `MotionGenerator`
@@ -82,6 +85,44 @@ wherever the robot is to `protocol.HOME_JOINT_POSITIONS` (0, −π/4, 0, −3π/
 Nothing is planned or previewed on the GPU PC, so check that the way is clear first.
 `speed_factor` can be at most the miniPC's velocity scale (0.3). `stop()`, Ctrl+C and
 the other checks work as they do for a trajectory.
+
+## Velocity control
+
+For a motion that is not known in advance, such as visual servoing, the robot can
+follow a velocity that your program keeps sending instead of a trajectory:
+
+```python
+with robot.start_servo() as servo:
+    while not done:
+        twist = ...  # [vx, vy, vz, wx, wy, wz] of the end effector, from a camera image for example
+        servo.set_twist(twist)  # in the end effector's own frame, or frame="base"
+```
+
+`start_servo()` puts the robot under velocity control and returns a `Servo`. The end
+effector follows the twist of the last `set_twist()`: its linear velocity [m/s], then
+its angular velocity [rad/s]. `servo.stop()`, or leaving the `with` block, slows the
+robot down to rest. Meanwhile the robot is busy for the other GPU PC, as during a
+trajectory.
+
+Nothing is previewed, so the miniPC keeps the motion within limits of its own,
+whatever twist it is sent:
+
+| The miniPC | Default | `servo.limited` then has |
+|---|---|---|
+| Takes the twist to be zero when no new one has come in time, so the robot stops when your program does | 0.25 s | `timeout` |
+| Scales down a twist that is too fast, keeping its direction | 0.1 m/s, 0.5 rad/s | `speed` |
+| Changes the twist gradually | 0.3 s from rest to those speeds | |
+| Does not drive the end effector below a minimum height above the robot's base | 0.02 m | `height` |
+| Slows all joints down together where one would be too fast, as near a singularity | 0.3 × the joint velocity limits | `joint_velocity` |
+| Stops the robot before a joint limit | 0.05 rad before it | `joint_position` |
+| Slows the robot down to a crawl near a singularity (the arm stretched out, for example), where the end effector cannot move the way it is asked to and would go astray | | `singularity` |
+
+So call `set_twist()` at a steady rate, for example once for every camera image.
+`servo.limited` names what holds the robot back at the moment. Velocity control ends
+by itself, and the next `set_twist()` raises `RobotError`, when a reflex or the user
+stop stops the robot, when a joint cannot follow, and when any client calls `stop()`.
+`servo.error` then says why, and the `with` block raises it at its end if nothing
+else did.
 
 ## Setup
 
@@ -151,6 +192,8 @@ on the robot always works and does not depend on any of this.
   so the miniPC refuses it. Plan again from `get_current_joint_positions()`.
 * The gripper is shared the same way: one command at a time, and not while the other
   PC's trajectory runs.
+* Velocity control takes the robot like a trajectory does: while one PC has it, the
+  other's requests raise `RobotBusy`, and its `stop()` ends it.
 * `RtbVisualizer(..., real_robot=robot)` adds a translucent blue Panda that follows the real
   robot, so each PC sees when the other one moves it.
 

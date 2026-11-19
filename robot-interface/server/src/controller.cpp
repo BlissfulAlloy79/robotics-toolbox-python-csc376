@@ -204,6 +204,68 @@ Controller::Submission Controller::moveToJointPositions(const Vec7& q_goal, doub
     return submission;
 }
 
+Controller::Submission Controller::startServo()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    Submission submission;
+    Measured state;
+    submission.code = readyLocked(submission.message, state);
+    if (submission.code != ErrorCodes::Success)
+        return submission;
+    {
+        // It starts at rest, whatever the last one was left with.
+        std::lock_guard<std::mutex> target_lock(servo_mutex_);
+        servo_target_ = ServoTarget{};
+    }
+    servo_end_requested_ = false;
+    pending_ = Pending::Servo;
+    pending_id_ = next_id_++;
+    submission.id = pending_id_;
+    wake_ = true;
+    cv_.notify_all();
+    return submission;
+}
+
+namespace
+{
+// No twist given to setServoTwist may be larger than this [m/s, rad/s].
+constexpr double kServoTwistMax = 1000.0;
+} // namespace
+
+bool Controller::servoRunningLocked(std::uint64_t id) const
+{
+    return status_ == Status::Executing && active_motion_ == Motion::Servo && active_id_ == id;
+}
+
+ValidationResult Controller::setServoTwist(std::uint64_t id, const Vec6& twist, TwistFrame frame)
+{
+    for (int i = 0; i < 6; ++i)
+    {
+        // Bounded as well: the speed limits scale it down, which must not overflow.
+        if (!std::isfinite(twist[i]) || std::abs(twist[i]) > kServoTwistMax)
+            return {ErrorCodes::NonFiniteValue,
+                    "twist[" + std::to_string(i) + "] is not a finite number within +-1000"};
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool pending = pending_ == Pending::Servo && pending_id_ == id;
+    if (!pending && !servoRunningLocked(id))
+        return {ErrorCodes::RobotNotReady, "The robot is not under this velocity control (it has ended)"};
+    std::lock_guard<std::mutex> target_lock(servo_mutex_);
+    servo_target_.twist = twist;
+    servo_target_.frame = frame;
+    ++servo_target_.seq;
+    return {};
+}
+
+void Controller::endServo(std::uint64_t id)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_ == Pending::Servo && pending_id_ == id)
+        finishPendingLocked(ErrorCodes::Success, "");
+    else if (servoRunningLocked(id))
+        servo_end_requested_ = true;
+}
+
 Controller::Submission Controller::recover()
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -232,6 +294,8 @@ void Controller::stop()
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_ == Pending::Execute || pending_ == Pending::JointMotion)
         finishPendingLocked(ErrorCodes::Interrupted, "The trajectory was stopped before it started");
+    else if (pending_ == Pending::Servo)
+        finishPendingLocked(ErrorCodes::Interrupted, "Velocity control was stopped before it started");
     if (status_ == Status::Executing)
         stop_requested_ = true;
 }
@@ -245,6 +309,7 @@ Controller::Snapshot Controller::snapshot() const
         s.connected = status_ == Status::Idle || status_ == Status::Executing || status_ == Status::Recovering;
         s.connection_error = connection_error_;
         s.active_id = active_id_;
+        s.motion = active_id_ != 0 ? active_motion_ : Motion::None;
         s.results.assign(results_.begin(), results_.end());
     }
     {
@@ -263,6 +328,8 @@ Controller::Snapshot Controller::snapshot() const
             s.settling = settling_;
             s.q_d = q_d_;
             s.dq_d = dq_d_;
+            s.twist = twist_;
+            s.limited = limited_;
         }
     }
     if (s.connected)
@@ -325,6 +392,7 @@ void Controller::run()
             const double dt = pending_dt_;
             pending_ = Pending::None;
             active_id_ = id;
+            active_motion_ = Motion::Trajectory;
             status_ = Status::Executing;
             stop_requested_ = false;
             lock.unlock();
@@ -343,10 +411,28 @@ void Controller::run()
             const double speed_factor = pending_speed_factor_;
             pending_ = Pending::None;
             active_id_ = id;
+            active_motion_ = Motion::JointMotion;
             status_ = Status::Executing;
             stop_requested_ = false;
             lock.unlock();
             runJointMotion(id, q_goal, speed_factor);
+            lock.lock();
+            active_id_ = 0;
+            if (status_ == Status::Executing)
+                status_ = Status::Idle;
+            continue;
+        }
+
+        if (pending_ == Pending::Servo)
+        {
+            const std::uint64_t id = pending_id_;
+            pending_ = Pending::None;
+            active_id_ = id;
+            active_motion_ = Motion::Servo;
+            status_ = Status::Executing;
+            stop_requested_ = false;
+            lock.unlock();
+            runServo(id);
             lock.lock();
             active_id_ = 0;
             if (status_ == Status::Executing)
@@ -527,6 +613,71 @@ void Controller::runJointMotion(std::uint64_t id, const Vec7& q_goal, double spe
     });
 }
 
+void Controller::runServo(std::uint64_t id)
+{
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        index_ = 0;
+        length_ = 0;
+        time_ = 0.0;
+        duration_ = 0.0;
+        stopping_ = false;
+        settling_ = false;
+        q_d_ = state_.q;
+        dq_d_.fill(0.0);
+        twist_.fill(0.0);
+        limited_ = 0;
+    }
+
+    runMotion(id, [&] {
+        TwistFollower follower(limits_);
+        std::uint64_t seen = 0;
+        bool interrupted = false;
+        Progress progress;
+        // The Jacobian at other joint positions than the measured ones, for
+        // the cycle's measured state.
+        const Measured* current = nullptr;
+        const TwistFollower::JacobianAt jacobian_at = [&](const Vec7& q) {
+            Measured moved = *current;
+            moved.q = q;
+            return backend_->endEffectorJacobian(moved);
+        };
+        backend_->controlJointVelocities([&](const Measured& measured, double period) {
+            current = &measured;
+            {
+                std::unique_lock<std::mutex> lock(servo_mutex_, std::try_to_lock);
+                if (lock.owns_lock() && servo_target_.seq != seen)
+                {
+                    seen = servo_target_.seq;
+                    follower.setTarget(servo_target_.twist, servo_target_.frame);
+                }
+            }
+            // endServo() ends it as a success, stop() as interrupted: whichever
+            // comes first while it runs, and stop() when they come together.
+            const bool stop = stop_requested_.load(std::memory_order_relaxed);
+            const bool end = servo_end_requested_.load(std::memory_order_relaxed);
+            if (stop && follower.phase() == TwistFollower::Phase::Running)
+                interrupted = true;
+            follower.step(period, measured, backend_->endEffectorJacobian(measured), stop || end, jacobian_at);
+            // The robot's own controller follows the velocity; q_d is where it has got to.
+            checkTracking(measured.q_d, measured.q);
+            progress.time += period;
+            progress.stopping = follower.phase() != TwistFollower::Phase::Running;
+            progress.q_d = measured.q_d;
+            progress.dq_d = follower.dqCommand();
+            progress.twist = follower.twist();
+            progress.limited = follower.limited();
+            publish(measured, &progress);
+            Command command;
+            command.q_d = measured.q_d;
+            command.dq_d = follower.dqCommand();
+            command.finished = follower.phase() == TwistFollower::Phase::Done;
+            return command;
+        });
+        return interrupted;
+    });
+}
+
 void Controller::runMotion(std::uint64_t id, const std::function<bool()>& motion)
 {
     ErrorCodes code = ErrorCodes::Success;
@@ -619,6 +770,8 @@ void Controller::publish(const Measured& measured, const Progress* progress)
         settling_ = progress->settling;
         q_d_ = progress->q_d;
         dq_d_ = progress->dq_d;
+        twist_ = progress->twist;
+        limited_ = progress->limited;
     }
 }
 
@@ -648,6 +801,7 @@ void Controller::finish(std::uint64_t id, ErrorCodes code, const std::string& me
     // In the same breath as the result, so that no snapshot shows a finished
     // command still running.
     active_id_ = 0;
+    active_motion_ = Motion::None;
     if (status_ == Status::Executing || status_ == Status::Recovering)
         status_ = Status::Idle;
 }

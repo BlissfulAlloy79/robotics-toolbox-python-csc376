@@ -5,7 +5,7 @@ Plan trajectories (csc376_franky.motion_generator), preview them in Swift
 server on the station's miniPC (FrankaJointTrajectoryController).
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 from .client import (
     FrankaJointTrajectoryController,
@@ -13,6 +13,7 @@ from .client import (
     GripperState,
     RobotError,
     RobotState,
+    Servo,
 )
 from .protocol import DEFAULT_HOST, DEFAULT_PORT, ErrorCodes
 
@@ -25,4 +26,5 @@ __all__ = [
     "GripperState",
     "RobotError",
     "RobotState",
+    "Servo",
 ]

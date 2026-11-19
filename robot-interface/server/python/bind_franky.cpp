@@ -64,6 +64,74 @@ const char* phaseName(TrajectoryFollower::Phase phase)
     return "unknown";
 }
 
+const char* motionName(Controller::Motion motion)
+{
+    switch (motion)
+    {
+    case Controller::Motion::None: return "none";
+    case Controller::Motion::Trajectory: return "trajectory";
+    case Controller::Motion::JointMotion: return "joint_motion";
+    case Controller::Motion::Servo: return "servo";
+    }
+    return "unknown";
+}
+
+const char* followerPhaseName(TwistFollower::Phase phase)
+{
+    switch (phase)
+    {
+    case TwistFollower::Phase::Running: return "running";
+    case TwistFollower::Phase::Stopping: return "stopping";
+    case TwistFollower::Phase::Done: return "done";
+    }
+    return "unknown";
+}
+
+// The names csc376_franky/protocol.py gives the frames of a twist.
+TwistFrame frameFromName(const std::string& name)
+{
+    if (name == "base")
+        return TwistFrame::Base;
+    if (name == "end_effector")
+        return TwistFrame::EndEffector;
+    throw py::value_error("unknown twist frame: " + name);
+}
+
+py::list limitedNames(unsigned limited)
+{
+    py::list names;
+    for (const auto bit : {TwistFollower::Timeout, TwistFollower::Speed, TwistFollower::Height,
+                           TwistFollower::JointVelocity, TwistFollower::JointPosition, TwistFollower::Singularity})
+    {
+        if ((limited & bit) != 0)
+            names.append(limitedName(bit));
+    }
+    return names;
+}
+
+// A 6 x 7 array, as numpy has it, from a Jacobian (column-major) and back.
+Array jacobianArray(const Jacobian& J)
+{
+    Array array({6, kDof});
+    auto rows = array.mutable_unchecked<2>();
+    for (int r = 0; r < 6; ++r)
+        for (int j = 0; j < kDof; ++j)
+            rows(r, j) = J[j * 6 + r];
+    return array;
+}
+
+Jacobian toJacobian(const Array& array)
+{
+    if (array.ndim() != 2 || array.shape(0) != 6 || array.shape(1) != kDof)
+        throw py::value_error("The Jacobian must be a 6 x 7 array");
+    const auto rows = array.unchecked<2>();
+    Jacobian J{};
+    for (int r = 0; r < 6; ++r)
+        for (int j = 0; j < kDof; ++j)
+            J[j * 6 + r] = rows(r, j);
+    return J;
+}
+
 py::object textOrNone(const std::string& text)
 {
     return text.empty() ? py::object(py::none()) : py::object(py::str(text));
@@ -100,6 +168,7 @@ py::dict snapshotDict(const Controller::Snapshot& s)
     {
         py::dict t;
         t["id"] = s.active_id;
+        t["kind"] = motionName(s.motion);
         t["index"] = s.index;
         t["length"] = s.length;
         t["time"] = s.time;
@@ -108,6 +177,11 @@ py::dict snapshotDict(const Controller::Snapshot& s)
         t["settling"] = s.settling;
         t["q_d"] = s.q_d;
         t["dq_d"] = s.dq_d;
+        if (s.motion == Controller::Motion::Servo)
+        {
+            t["twist"] = s.twist;
+            t["limited"] = limitedNames(s.limited);
+        }
         d["trajectory"] = t;
     }
     else
@@ -202,7 +276,14 @@ PYBIND11_MODULE(_control, m)
         .def_readwrite("settle_velocity", &Limits::settle_velocity)
         .def_readwrite("settle_timeout", &Limits::settle_timeout)
         .def_readwrite("stiffness", &Limits::stiffness)
-        .def_readwrite("damping", &Limits::damping);
+        .def_readwrite("damping", &Limits::damping)
+        .def_readwrite("servo_linear_velocity", &Limits::servo_linear_velocity)
+        .def_readwrite("servo_angular_velocity", &Limits::servo_angular_velocity)
+        .def_readwrite("servo_ramp_time", &Limits::servo_ramp_time)
+        .def_readwrite("servo_timeout", &Limits::servo_timeout)
+        .def_readwrite("servo_joint_limit_margin", &Limits::servo_joint_limit_margin)
+        .def_readwrite("servo_damping", &Limits::servo_damping)
+        .def_readwrite("servo_min_height", &Limits::servo_min_height);
 
     m.def(
         "validate_trajectory",
@@ -234,6 +315,36 @@ PYBIND11_MODULE(_control, m)
         .def_property_readonly("index", &TrajectoryFollower::index)
         .def_property_readonly("time", &TrajectoryFollower::time)
         .def_property_readonly("duration", &TrajectoryFollower::duration);
+
+    py::class_<TwistFollower>(m, "TwistFollower")
+        .def(py::init<const Limits&>(), "limits"_a = Limits())
+        .def(
+            "set_target",
+            [](TwistFollower& f, const Vec6& twist, const std::string& frame) {
+                f.setTarget(twist, frameFromName(frame));
+            },
+            "twist"_a, "frame"_a = "end_effector")
+        .def(
+            "step",
+            [](TwistFollower& f, double period, const Vec7& q, const Vec7& dq, const std::array<double, 16>& O_T_EE,
+               const Array& jacobian, bool stop_requested) {
+                Measured measured;
+                measured.q = q;
+                measured.q_d = q;
+                measured.dq = dq;
+                measured.O_T_EE = O_T_EE;
+                f.step(period, measured, toJacobian(jacobian), stop_requested, pandaJacobian);
+            },
+            "period"_a, "q"_a, "dq"_a, "O_T_EE"_a, "jacobian"_a, "stop_requested"_a = false)
+        .def_property_readonly("dq_c", &TwistFollower::dqCommand)
+        .def_property_readonly("twist", &TwistFollower::twist)
+        .def_property_readonly("phase", [](const TwistFollower& f) { return followerPhaseName(f.phase()); })
+        .def_property_readonly("limited", [](const TwistFollower& f) { return limitedNames(f.limited()); });
+
+    m.def("sim_pose", &pandaPose, "q"_a, "The simulated robot's end-effector pose in the base frame, like O_T_EE");
+    m.def(
+        "sim_jacobian", [](const Vec7& q) { return jacobianArray(pandaJacobian(q)); }, "q"_a,
+        "The simulated robot's end-effector Jacobian in the base frame, 6 x 7");
 
     py::class_<JointMotionGenerator>(m, "JointMotionGenerator")
         .def(py::init<const Vec7&, const Vec7&, double>(), "q_start"_a, "q_goal"_a, "speed_factor"_a)
@@ -311,6 +422,32 @@ PYBIND11_MODULE(_control, m)
             },
             "q_goal"_a, "speed_factor"_a,
             "Start a move with libfranka's example MotionGenerator; returns (error code, message, id)")
+        .def(
+            "start_servo",
+            [](Controller& c) {
+                Controller::Submission submission;
+                {
+                    py::gil_scoped_release release;
+                    submission = c.startServo();
+                }
+                return submissionTuple(submission);
+            },
+            "Start velocity control; returns (error code, message, id)")
+        .def(
+            "set_servo_twist",
+            [](Controller& c, std::uint64_t id, const Vec6& twist, const std::string& frame) {
+                const TwistFrame twist_frame = frameFromName(frame);
+                ValidationResult result;
+                {
+                    py::gil_scoped_release release;
+                    result = c.setServoTwist(id, twist, twist_frame);
+                }
+                return py::make_tuple(static_cast<int>(result.code), result.message);
+            },
+            "id"_a, "twist"_a, "frame"_a = "end_effector",
+            "The twist for the velocity control with this id to follow; returns (error code, message)")
+        .def("end_servo", &Controller::endServo, "id"_a, py::call_guard<py::gil_scoped_release>(),
+             "Slow the velocity control with this id down to rest and end it")
         .def(
             "recover",
             [](Controller& c) {

@@ -8,6 +8,7 @@ machine, which is how to try the clients without a robot.
 import argparse
 import asyncio
 import logging
+import math
 import os
 import resource
 import signal
@@ -74,6 +75,31 @@ def build_parser():
         "trajectory points (default: 1.0)",
     )
     p.add_argument(
+        "--servo-linear-velocity",
+        type=float,
+        default=None,
+        help="fastest the end effector may be asked to move under velocity control [m/s] (default: 0.1)",
+    )
+    p.add_argument(
+        "--servo-angular-velocity",
+        type=float,
+        default=None,
+        help="fastest the end effector may be asked to turn under velocity control [rad/s] (default: 0.5)",
+    )
+    p.add_argument(
+        "--servo-timeout",
+        type=float,
+        default=None,
+        help="under velocity control, stop the robot when no new twist has come for this long [s] (default: 0.25)",
+    )
+    p.add_argument(
+        "--servo-min-height",
+        type=float,
+        default=None,
+        help="height above the robot's base below which velocity control does not drive the end effector [m] "
+        "(default: 0.02)",
+    )
+    p.add_argument(
         "--state-rate",
         type=float,
         default=50.0,
@@ -124,6 +150,8 @@ def check_realtime():
 def make_limits(control, args):
     limits = control.Limits()
     if args.start_tolerance is not None:
+        if not math.isfinite(args.start_tolerance):
+            sys.exit("error: --start-tolerance must be a number")
         limits.start_tolerance = args.start_tolerance
     if args.velocity_scale is not None:
         if not 0.0 < args.velocity_scale <= 1.0:
@@ -133,6 +161,16 @@ def make_limits(control, args):
         if not args.acceleration_scale > 0.0:
             sys.exit("error: --acceleration-scale must be positive")
         limits.acceleration_scale = args.acceleration_scale
+    for name in ("servo_linear_velocity", "servo_angular_velocity", "servo_timeout"):
+        value = getattr(args, name)
+        if value is not None:
+            if not 0.0 < value < math.inf:
+                sys.exit(f"error: --{name.replace('_', '-')} must be positive")
+            setattr(limits, name, value)
+    if args.servo_min_height is not None:
+        if not math.isfinite(args.servo_min_height):
+            sys.exit("error: --servo-min-height must be a number")
+        limits.servo_min_height = args.servo_min_height
     return limits
 
 

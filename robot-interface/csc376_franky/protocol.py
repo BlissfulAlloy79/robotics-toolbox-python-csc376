@@ -18,7 +18,20 @@ and sends the robot's state to every client, state_rate times a second::
     {"event": "state", "time": ..., "robot": {...}, "trajectory": ..., "gripper": {...}}
 
 Requests: hello (first), state, ping, heartbeat, execute, move_home, stop,
-recover, gripper_homing, gripper_move, gripper_grasp, gripper_stop.
+recover, servo_start, servo_twist, servo_stop, gripper_homing, gripper_move,
+gripper_grasp, gripper_stop.
+
+Velocity control (servoing) is one request that lasts as long as the motion::
+
+    {"op": "servo_start", "id": 8}
+
+The server answers it when velocity control has ended. Meanwhile the client
+streams the twist the end effector should follow, as notifications::
+
+    {"op": "servo_twist", "twist": [vx, vy, vz, wx, wy, wz], "frame": "end_effector"}
+
+and ends it with servo_stop. The hello reply lists "servo" among its
+"features" if the server has it.
 """
 
 import enum
@@ -41,6 +54,11 @@ MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 # The client sends a heartbeat this often; a trajectory is stopped when its
 # client has been silent for the server's owner timeout (2 s by default).
 HEARTBEAT_INTERVAL = 0.5
+
+# The frames a twist can be given in: the end effector's own, or the robot's base.
+# Either way it is the linear velocity of the end effector's origin [m/s], then
+# the end effector's angular velocity [rad/s].
+TWIST_FRAMES = ("end_effector", "base")
 
 # The home pose of libfranka's examples, where move_home goes.
 HOME_JOINT_POSITIONS = (

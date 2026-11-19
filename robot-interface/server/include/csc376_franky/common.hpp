@@ -10,6 +10,10 @@ namespace csc376_franky
 
 constexpr int kDof = 7;
 using Vec7 = std::array<double, kDof>;
+// A twist: linear velocity [m/s], then angular velocity [rad/s].
+using Vec6 = std::array<double, 6>;
+// A 6 x 7 Jacobian in column-major order, like franka::Model::zeroJacobian.
+using Jacobian = std::array<double, 6 * kDof>;
 
 // Franka Emika Panda (FER) joint limits, from the robot's datasheet.
 constexpr Vec7 kJointPositionMin = {-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973};
@@ -96,6 +100,24 @@ struct Limits
     // Joint impedance of the old controller [Nm/rad], [Nms/rad].
     Vec7 stiffness = {600.0, 900.0, 600.0, 300.0, 300.0, 200.0, 100.0};
     Vec7 damping = {50.0, 70.0, 70.0, 60.0, 30.0, 15.0, 10.0};
+
+    // Velocity control (servoing), where a client streams the twist the end
+    // effector should follow. A twist faster than this is scaled down, keeping
+    // its direction [m/s], [rad/s].
+    double servo_linear_velocity = 0.1;
+    double servo_angular_velocity = 0.5;
+    // Time to reach those speeds from rest, and to slow down from them to rest [s].
+    double servo_ramp_time = 0.3;
+    // A twist older than this is replaced by zero, so the robot stops when its
+    // client goes quiet [s].
+    double servo_timeout = 0.25;
+    // Joints slow down to rest this far inside their limits [rad].
+    double servo_joint_limit_margin = 0.05;
+    // Damping of the Jacobian's inverse, which bounds the joint velocities
+    // near a singularity.
+    double servo_damping = 0.02;
+    // The end effector is not driven below this height above the robot's base [m].
+    double servo_min_height = 0.02;
 };
 
 // Ends a trajectory early with a reason. Thrown from inside the control
