@@ -7,6 +7,11 @@ command, is running, and when it does not start where the robot is. Any
 client can stop the running trajectory. A trajectory is also stopped when its
 client disconnects or stops sending heartbeats.
 
+Velocity control (servoing) takes the robot the same way a trajectory does,
+for as long as it lasts: its client streams the twist that the end effector
+is to follow, and the controller keeps the motion within its limits and stops
+it when the twists stop coming.
+
 The robot connection is opened when the first client connects and closed
 idle_release seconds after the last one leaves, so the robot is free for
 other FCI programs (Desk tasks, for example) the rest of the time.
@@ -58,6 +63,9 @@ class Session:
         return f"{self.host} ({self.peer})"
 
 
+SERVO = "velocity control"
+
+
 @dataclass(eq=False)
 class Execution:
     session: Session
@@ -67,8 +75,17 @@ class Execution:
     future: asyncio.Future
     # The task that answers the request once the motion has ended.
     task: asyncio.Task
+    # What is running: "trajectory", "move home" or SERVO.
+    what: str = "trajectory"
     # Why it was stopped, if it was, for the reply's message.
     stopped_by: str = ""
+
+    @property
+    def doing(self):
+        """What the robot is doing for its owner, for a message to another client."""
+        return (
+            "under velocity control" if self.what == SERVO else "executing a trajectory"
+        )
 
 
 def _configure_socket(sock):
@@ -97,6 +114,29 @@ def _number(message, name, default=None, minimum=None):
             ErrorCodes.InvalidRequest, f"{name} must be at least {minimum}"
         )
     return float(value)
+
+
+# No number in a vector may be larger than this: far beyond anything a robot does,
+# and small enough for arithmetic with it not to overflow.
+_LARGEST = 1e9
+
+
+def _vector(message, name, size):
+    value = message.get(name)
+    if (
+        not isinstance(value, list)
+        or len(value) != size
+        or any(
+            isinstance(x, bool)
+            or not isinstance(x, (int, float))
+            or not -_LARGEST <= x <= _LARGEST  # also refuses NaN
+            for x in value
+        )
+    ):
+        raise RequestError(
+            ErrorCodes.InvalidRequest, f"{name} must be a list of {size} finite numbers"
+        )
+    return [float(x) for x in value]
 
 
 class RobotServer:
@@ -329,6 +369,9 @@ class RobotServer:
             "backend": self.controller.backend,
             "robot": self.controller.address,
             "gripper": self.gripper is not None,
+            # What this server can do beyond protocol 1's first requests, so
+            # that a client can tell before it asks.
+            "features": ["servo"],
             "state_rate": 1.0 / session.state_period
             if session.state_period > 0
             else 0.0,
@@ -345,6 +388,12 @@ class RobotServer:
                 "max_duration": limits.max_duration,
                 "max_points": limits.max_points,
                 "stop_time": limits.stop_time,
+                "servo_linear_velocity": limits.servo_linear_velocity,
+                "servo_angular_velocity": limits.servo_angular_velocity,
+                "servo_ramp_time": limits.servo_ramp_time,
+                "servo_timeout": limits.servo_timeout,
+                "servo_joint_limit_margin": limits.servo_joint_limit_margin,
+                "servo_min_height": limits.servo_min_height,
             },
         }
 
@@ -393,6 +442,48 @@ class RobotServer:
         )
         await self._run_motion(session, message, submission, 2, 0.0, what="move home")
         return {}
+
+    async def _op_servo_start(self, session, message):
+        """Velocity control: the end effector follows the twists of servo_twist.
+
+        Answered when it has ended: by this client's servo_stop (a success),
+        by stop, a silent or disconnected client, or an error.
+        """
+        self._require_gripper_idle(session)
+        await self._run_motion(
+            session, message, self.controller.start_servo(), 0, 0.0, what=SERVO
+        )
+        return {}
+
+    async def _op_servo_twist(self, session, message):
+        twist = _vector(message, "twist", 6)
+        frame = message.get("frame", protocol.TWIST_FRAMES[0])
+        if frame not in protocol.TWIST_FRAMES:
+            raise RequestError(
+                ErrorCodes.InvalidRequest,
+                f"frame must be one of {', '.join(protocol.TWIST_FRAMES)}",
+            )
+        controller_id = self._servo_of(session)
+        if controller_id is None:
+            owner = self._arm_owner()
+            if owner is not None and owner is not session:
+                raise RequestError(ErrorCodes.RobotBusy, self._busy_message(session))
+            raise RequestError(
+                ErrorCodes.InvalidRequest,
+                "No velocity control is running for this client: servo_start starts it",
+            )
+        code, text = self.controller.set_servo_twist(controller_id, twist, frame)
+        if ErrorCodes(code) != ErrorCodes.Success:
+            raise RequestError(code, text)
+        return {}
+
+    async def _op_servo_stop(self, session, message):
+        """This client's velocity control slows down to rest and ends as a success."""
+        controller_id = self._servo_of(session)
+        if controller_id is not None:
+            log.info("session %d: ending its velocity control", session.id)
+            self.controller.end_servo(controller_id)
+        return {"was_active": controller_id is not None}
 
     async def _op_stop(self, session, message):
         self._refresh()
@@ -486,6 +577,7 @@ class RobotServer:
             duration,
             asyncio.get_running_loop().create_future(),
             asyncio.current_task(),
+            what,
         )
         self._executions[controller_id] = execution
         if what == "trajectory":
@@ -534,11 +626,11 @@ class RobotServer:
                 ErrorCodes.RobotBusy,
                 f"The gripper is busy with a command from {self._gripper_owner.label}",
             )
-        owner = self._arm_owner()
-        if owner is not None and owner is not session:
+        execution = self._arm_execution()
+        if execution is not None and execution.session is not session:
             raise RequestError(
                 ErrorCodes.RobotBusy,
-                f"The robot is executing a trajectory for {owner.label}",
+                f"The robot is {execution.doing} for {execution.session.label}",
             )
         self._gripper_owner = session
         log.info("session %d: gripper %s%s", session.id, name, args)
@@ -553,19 +645,28 @@ class RobotServer:
             raise RequestError(code, text)
         return {"success": bool(success)}
 
+    def _arm_execution(self):
+        # The controller runs one motion at a time, so there is at most one.
+        return next(iter(self._executions.values())) if self._executions else None
+
     def _arm_owner(self):
-        # The controller runs one trajectory at a time, so there is at most one.
-        return (
-            next(iter(self._executions.values())).session if self._executions else None
-        )
+        execution = self._arm_execution()
+        return execution.session if execution is not None else None
+
+    def _servo_of(self, session):
+        """The controller's id of the velocity control running for session, or None."""
+        for controller_id, execution in self._executions.items():
+            if execution.what == SERVO and execution.session is session:
+                return controller_id
+        return None
 
     def _busy_message(self, session):
-        owner = self._arm_owner()
-        if owner is session:
-            return "The robot is already executing a trajectory for this client"
-        if owner is not None:
+        execution = self._arm_execution()
+        if execution is not None and execution.session is session:
+            return f"The robot is already {execution.doing} for this client"
+        if execution is not None:
             return (
-                f"The robot is executing a trajectory for {owner.label}. Wait until it finishes, then plan "
+                f"The robot is {execution.doing} for {execution.session.label}. Wait until it finishes, then plan "
                 "again from the robot's current position."
             )
         if self._snapshot["status"] == "recovering":
@@ -657,6 +758,7 @@ class RobotServer:
             trajectory = {
                 key: t[key]
                 for key in (
+                    "kind",
                     "index",
                     "length",
                     "time",
@@ -664,7 +766,11 @@ class RobotServer:
                     "stopping",
                     "settling",
                     "q_d",
+                    # Under velocity control only.
+                    "twist",
+                    "limited",
                 )
+                if key in t
             }
             trajectory.update(
                 session=execution.session.id if execution else None,

@@ -9,6 +9,11 @@
 namespace csc376_franky
 {
 
+// The simulated robot's kinematics: the pose of its end effector (the Franka
+// Hand TCP) in the base frame, column-major like O_T_EE, and its Jacobian there.
+std::array<double, 16> pandaPose(const Vec7& q);
+Jacobian pandaJacobian(const Vec7& q);
+
 // A stand-in for the robot, for testing the server and clients without one.
 // The arm follows the commanded joint state as a critically damped second
 // order system; O_T_EE is the Panda's forward kinematics with the Franka Hand
@@ -26,6 +31,8 @@ public:
     void read(const ReadCallback& callback) override;
     void control(const ControlCallback& callback) override;
     void controlJointPositions(const ControlCallback& callback) override;
+    void controlJointVelocities(const ControlCallback& callback) override;
+    Jacobian endEffectorJacobian(const Measured& measured) const override;
     void recover() override;
     void errors(std::vector<std::string>& current, std::vector<std::string>& last_motion) const override;
 
@@ -43,9 +50,17 @@ public:
     void refuseConnections(const std::string& reason);
 
 private:
+    // How the robot follows a command.
+    enum class Interface
+    {
+        Torques,
+        JointPositions,
+        JointVelocities,
+    };
+
     Measured measuredLocked() const;
-    // The control loop of control() and controlJointPositions().
-    void run(const ControlCallback& callback, bool joint_positions);
+    // The control loop of control(), controlJointPositions() and controlJointVelocities().
+    void run(const ControlCallback& callback, Interface interface);
 
     mutable std::mutex mutex_;
     double speed_;
@@ -53,6 +68,10 @@ private:
     std::string refuse_reason_;
     Vec7 q_{};
     Vec7 dq_{};
+    // Where the robot's own controller commands the joints, when that differs
+    // from where they are: during a joint velocity motion.
+    Vec7 q_d_{};
+    bool has_q_d_ = false;
     double time_ = 0.0;
     int mode_ = static_cast<int>(RobotMode::Idle);
     bool reflex_pending_ = false;
