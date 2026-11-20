@@ -522,6 +522,58 @@ class FrankaJointTrajectoryController:
         except (RobotError, concurrent.futures.TimeoutError):
             pass
 
+    def start_servo(self, timeout=5.0):
+        """Put the robot under velocity control (servoing) and return its Servo.
+
+        The end effector then follows the twist of Servo.set_twist, which a
+        program sends again and again: from each camera image, for example.
+        It ends with Servo.stop(), or at the end of a with block:
+
+            with robot.start_servo() as servo:
+                while ...:
+                    servo.set_twist([0, 0, 0.01, 0, 0, 0])  # 1 cm/s along the hand's z axis
+
+        The robot is busy for other clients meanwhile, as during a trajectory.
+        Raises RobotError if the miniPC refuses, for the reasons it refuses a
+        trajectory for (RobotBusy, RobotNotReady).
+        """
+        if "servo" not in self.server_info.get("features", ()):
+            raise RobotError(
+                ErrorCodes.IncompatibleVersion,
+                f"The robot server on the miniPC ({self.server_info.get('server', 'an older version')}) has no "
+                "velocity control. It needs csc376_franky_server 2.2 or later (ask your TA).",
+            )
+        future, request_id = self._connection.start_request("servo_start")
+
+        def started(state):
+            trajectory = state.get("trajectory") or {}
+            return (
+                trajectory.get("kind") == "servo"
+                and trajectory.get("session") == self.session
+                and trajectory.get("request") == request_id
+            )
+
+        servo = Servo(self._connection, future, started)
+        deadline = time.monotonic() + timeout
+        try:
+            # The miniPC answers servo_start when velocity control has ended, so
+            # an answer this early is a refusal; the robot's state shows the start.
+            while not future.done():
+                if self._connection.wait_for_state(started, 0.02) is not None:
+                    return servo
+                if time.monotonic() > deadline:
+                    raise RobotError(
+                        ErrorCodes.Timeout,
+                        f"The robot server did not start velocity control within {timeout} s",
+                    )
+            future.result()
+        except BaseException:
+            servo.stop()
+            raise
+        raise RobotError(
+            ErrorCodes.Interrupted, "Velocity control ended before it started"
+        )
+
     def stop(self):
         """Stop the running trajectory, whichever client started it: the robot
         slows to rest along its path within about half a second. Returns True
@@ -549,6 +601,143 @@ class FrankaJointTrajectoryController:
 
     def join(self):
         """Not needed any more: the control loop runs on the miniPC."""
+
+
+class Servo:
+    """The robot under velocity control, from FrankaJointTrajectoryController.start_servo().
+
+    The end effector follows the twist of set_twist() until stop(). The miniPC
+    keeps the motion within its limits whatever the twist: it scales a twist
+    that is too fast, changes speed gradually, stops the robot before a joint
+    limit, and keeps the end effector above a minimum height. It also
+    replaces a twist that is older than its timeout (0.25 s unless the miniPC
+    was set up otherwise) by zero, so the robot only moves while set_twist()
+    keeps being called.
+
+    As a context manager it stops the robot at the end of the with block, and
+    raises the RobotError that ended velocity control if something else did.
+    """
+
+    # set_twist() waits until this long after the twist before [s]: a loop
+    # that does nothing else would otherwise send twists faster than the
+    # miniPC takes them, and the robot would follow twists that are seconds old.
+    MIN_TWIST_PERIOD = 0.001
+
+    def __init__(self, connection, future, is_this):
+        self._connection = connection
+        self._future = future
+        self._last_twist_time = 0.0
+        # Whether a state message shows this velocity control running.
+        self._is_this = is_this
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *exc):
+        try:
+            self.stop()
+        except RobotError:
+            # Do not hide the exception that ended the with block.
+            if exc_type is None:
+                raise
+        error = self.error
+        if exc_type is None and isinstance(error, RobotError):
+            raise RobotError(error.code, error.message)
+
+    @property
+    def active(self):
+        """True until velocity control has ended, by stop() or by itself."""
+        return not self._future.done()
+
+    @property
+    def error(self):
+        """The RobotError that says why velocity control ended, if it was not by stop().
+
+        None otherwise. error.code is ErrorCodes.Interrupted when another
+        client's stop() ended it, and ErrorCodes.ControlException after a
+        reflex, for example.
+        """
+        if not self._future.done():
+            return None
+        return self._future.exception()
+
+    @property
+    def status(self):
+        """What the miniPC reports of this velocity control, or None once it has ended.
+
+        A dict with "twist", the twist the robot is following now in the base
+        frame, and "limited", the names of what holds that back from the twist
+        it was given: "timeout" (no new twist in time), "speed", "height",
+        "joint_velocity", "joint_position", "singularity".
+        """
+        state, _ = self._connection.latest_state()
+        if self._future.done() or state is None or not self._is_this(state):
+            return None
+        return state["trajectory"]
+
+    @property
+    def limited(self):
+        """The names of what holds the robot back from the twist it was given (see status)."""
+        status = self.status
+        return tuple(status.get("limited", ())) if status else ()
+
+    def set_twist(self, twist, frame="end_effector"):
+        """The twist for the end effector to follow from now on.
+
+        twist is [vx, vy, vz, wx, wy, wz]: the linear velocity of the end
+        effector's origin [m/s], then its angular velocity [rad/s], in the
+        end effector's own frame ("end_effector") or the robot's ("base").
+        Raises RobotError once velocity control has ended (e.code says why).
+        """
+        try:
+            values = [float(x) for x in twist]
+        except (TypeError, ValueError):
+            values = []
+        if len(values) != 6:
+            raise RobotError(
+                ErrorCodes.InvalidRequest,
+                "twist must be 6 numbers: [vx, vy, vz, wx, wy, wz]",
+            )
+        if not np.isfinite(values).all():
+            raise RobotError(ErrorCodes.NonFiniteValue, "twist must be finite numbers")
+        if frame not in protocol.TWIST_FRAMES:
+            raise RobotError(
+                ErrorCodes.InvalidRequest,
+                f"frame must be one of {', '.join(protocol.TWIST_FRAMES)}, not {frame!r}",
+            )
+        if self._future.done():
+            error = self.error
+            if isinstance(error, RobotError):
+                raise RobotError(error.code, error.message)
+            raise RobotError(ErrorCodes.Interrupted, "Velocity control has ended")
+        wait = self._last_twist_time + self.MIN_TWIST_PERIOD - time.monotonic()
+        if wait > 0.0:
+            time.sleep(wait)
+        self._last_twist_time = time.monotonic()
+        self._connection.notify("servo_twist", twist=values, frame=frame)
+
+    def stop(self, timeout=5.0):
+        """Slow the robot down to rest and end velocity control.
+
+        Returns True if it was still running, once the robot has stopped.
+        """
+        if self._future.done():
+            return False
+        try:
+            self._connection.request("servo_stop", timeout=timeout)
+        except RobotError as error:
+            if error.code == ErrorCodes.Timeout:
+                raise
+        try:
+            self._future.result(timeout)
+        except concurrent.futures.TimeoutError:
+            raise RobotError(
+                ErrorCodes.Timeout,
+                f"Velocity control did not end within {timeout} s",
+            ) from None
+        except RobotError:
+            pass  # it ended by itself meanwhile; error says why
+        return True
 
 
 class Gripper:

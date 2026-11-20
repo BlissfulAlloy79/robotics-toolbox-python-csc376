@@ -35,19 +35,31 @@ Mat4 dh(double a, double d, double alpha, double theta)
     return {ct, st * ca, st * sa, 0.0, -st, ct * ca, ct * sa, 0.0, 0.0, -sa, ca, 0.0, a, -d * sa, d * ca, 1.0};
 }
 
-// Base to Franka Hand TCP: the Panda's kinematics from Franka's documentation,
-// then the flange to TCP transform Desk uses for the Franka Hand.
-Mat4 pandaForwardKinematics(const Vec7& q)
+constexpr double kHalfPi = 1.5707963267948966;
+
+// The flange to TCP transform Desk uses for the Franka Hand.
+Mat4 handTcp()
 {
-    constexpr double kHalfPi = 1.5707963267948966;
+    return dh(0.0, 0.1034, 0.0, -kHalfPi / 2.0);
+}
+
+// Base to Franka Hand TCP: the Panda's kinematics from Franka's documentation,
+// then the flange to TCP transform. If joints is given, it receives the frame
+// of each joint, which turns about its z axis.
+Mat4 pandaForwardKinematics(const Vec7& q, std::array<Mat4, kDof>* joints = nullptr)
+{
     constexpr double kA[7] = {0.0, 0.0, 0.0, 0.0825, -0.0825, 0.0, 0.088};
     constexpr double kD[7] = {0.333, 0.0, 0.316, 0.0, 0.384, 0.0, 0.0};
     constexpr double kAlpha[7] = {0.0, -kHalfPi, kHalfPi, kHalfPi, -kHalfPi, kHalfPi, kHalfPi};
     Mat4 T = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     for (int j = 0; j < kDof; ++j)
+    {
         T = multiply(T, dh(kA[j], kD[j], kAlpha[j], q[j]));
+        if (joints != nullptr)
+            (*joints)[j] = T;
+    }
     T = multiply(T, dh(0.0, 0.107, 0.0, 0.0));
-    return multiply(T, dh(0.0, 0.1034, 0.0, -kHalfPi / 2.0));
+    return multiply(T, handTcp());
 }
 
 std::chrono::steady_clock::duration cycleDuration(double speed)
@@ -57,6 +69,32 @@ std::chrono::steady_clock::duration cycleDuration(double speed)
 }
 
 } // namespace
+
+std::array<double, 16> pandaPose(const Vec7& q)
+{
+    return pandaForwardKinematics(q);
+}
+
+// The geometric Jacobian: each joint moves the TCP with its axis crossed with
+// the lever from the axis to the TCP, and turns it about its axis.
+Jacobian pandaJacobian(const Vec7& q)
+{
+    std::array<Mat4, kDof> joints;
+    const Mat4 tcp = pandaForwardKinematics(q, &joints);
+    Jacobian J{};
+    for (int j = 0; j < kDof; ++j)
+    {
+        const double* axis = &joints[j][8];
+        const double lever[3] = {tcp[12] - joints[j][12], tcp[13] - joints[j][13], tcp[14] - joints[j][14]};
+        J[j * 6 + 0] = axis[1] * lever[2] - axis[2] * lever[1];
+        J[j * 6 + 1] = axis[2] * lever[0] - axis[0] * lever[2];
+        J[j * 6 + 2] = axis[0] * lever[1] - axis[1] * lever[0];
+        J[j * 6 + 3] = axis[0];
+        J[j * 6 + 4] = axis[1];
+        J[j * 6 + 5] = axis[2];
+    }
+    return J;
+}
 
 SimBackend::SimBackend(const Vec7& q_start, double speed) : speed_(speed > 0.0 ? speed : 1.0), q_(q_start) {}
 
@@ -85,8 +123,9 @@ Measured SimBackend::measuredLocked() const
     Measured m;
     m.q = q_;
     m.dq = dq_;
-    m.q_d = q_;
+    m.q_d = has_q_d_ ? q_d_ : q_;
     m.O_T_EE = pandaForwardKinematics(q_);
+    m.F_T_EE = handTcp();
     m.robot_mode = mode_;
     m.time = time_;
     m.control_command_success_rate = mode_ == static_cast<int>(RobotMode::Move) ? 1.0 : 0.0;
@@ -121,15 +160,25 @@ void SimBackend::read(const ReadCallback& callback)
 
 void SimBackend::control(const ControlCallback& callback)
 {
-    run(callback, false);
+    run(callback, Interface::Torques);
 }
 
 void SimBackend::controlJointPositions(const ControlCallback& callback)
 {
-    run(callback, true);
+    run(callback, Interface::JointPositions);
 }
 
-void SimBackend::run(const ControlCallback& callback, bool joint_positions)
+void SimBackend::controlJointVelocities(const ControlCallback& callback)
+{
+    run(callback, Interface::JointVelocities);
+}
+
+Jacobian SimBackend::endEffectorJacobian(const Measured& measured) const
+{
+    return pandaJacobian(measured.q);
+}
+
+void SimBackend::run(const ControlCallback& callback, Interface interface)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -141,6 +190,8 @@ void SimBackend::run(const ControlCallback& callback, bool joint_positions)
                                       robotModeName(mode_) + "\")!");
         mode_ = static_cast<int>(RobotMode::Move);
         last_motion_errors_.clear();
+        q_d_ = q_;
+        has_q_d_ = interface == Interface::JointVelocities;
     }
     const auto cycle = cycleDuration(speed_);
     auto next = std::chrono::steady_clock::now();
@@ -173,13 +224,31 @@ void SimBackend::run(const ControlCallback& callback, bool joint_positions)
             const Command command = callback(m, period);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                // Like the robot, which refuses a velocity motion that ends while it still moves.
+                if (interface == Interface::JointVelocities && command.finished &&
+                    std::any_of(command.dq_d.begin(), command.dq_d.end(), [](double v) { return v != 0.0; }))
+                {
+                    mode_ = static_cast<int>(RobotMode::Reflex);
+                    current_errors_ = {"joint_motion_generator_velocity_discontinuity"};
+                    last_motion_errors_ = current_errors_;
+                    throw BackendControlError("libfranka: Motion finished commanded, but the robot is still moving! "
+                                              "[\"joint_motion_generator_velocity_discontinuity\"]");
+                }
                 for (int j = 0; j < kDof; ++j)
                 {
-                    // The robot's internal controller follows a joint position command closely.
-                    if (joint_positions)
+                    // The robot's internal controller follows a joint position command closely,
+                    if (interface == Interface::JointPositions)
                     {
                         dq_[j] = (command.q_d[j] - q_[j]) / kCycle;
                         q_[j] = command.q_d[j];
+                        continue;
+                    }
+                    // and a joint velocity command by moving its own position command with it.
+                    if (interface == Interface::JointVelocities)
+                    {
+                        dq_[j] = command.dq_d[j];
+                        q_d_[j] += dq_[j] * kCycle;
+                        q_[j] += dq_[j] * kCycle;
                         continue;
                     }
                     const double ddq =
@@ -200,12 +269,14 @@ void SimBackend::run(const ControlCallback& callback, bool joint_positions)
         // The robot holds where it is once a motion is cancelled.
         std::lock_guard<std::mutex> lock(mutex_);
         dq_.fill(0.0);
+        has_q_d_ = false;
         if (mode_ == static_cast<int>(RobotMode::Move))
             mode_ = static_cast<int>(RobotMode::Idle);
         throw;
     }
     std::lock_guard<std::mutex> lock(mutex_);
     dq_.fill(0.0);
+    has_q_d_ = false;
     mode_ = static_cast<int>(RobotMode::Idle);
 }
 

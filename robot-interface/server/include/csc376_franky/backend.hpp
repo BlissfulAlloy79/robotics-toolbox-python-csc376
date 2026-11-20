@@ -24,6 +24,8 @@ struct Measured
     Vec7 tau_J{};
     Vec7 tau_ext_hat_filtered{};
     std::array<double, 16> O_T_EE{};
+    // The end effector in the flange frame, as Desk sets it up.
+    std::array<double, 16> F_T_EE{};
     std::array<double, 6> O_F_ext_hat_K{};
     std::array<double, 2> elbow{};
     int robot_mode = static_cast<int>(RobotMode::Other);
@@ -76,6 +78,13 @@ public:
     // The same with libfranka's joint position interface: the robot's own
     // joint impedance controller follows q_d (dq_d is ignored).
     virtual void controlJointPositions(const ControlCallback& callback) = 0;
+    // The same with libfranka's joint velocity interface: the robot's own
+    // joint impedance controller follows dq_d (q_d is ignored). The last
+    // command, the one with finished set, must be zero.
+    virtual void controlJointVelocities(const ControlCallback& callback) = 0;
+    // The Jacobian of the end effector (the frame of O_T_EE) in the base
+    // frame, for a measured state. Does not allocate.
+    virtual Jacobian endEffectorJacobian(const Measured& measured) const = 0;
     virtual void recover() = 0;
     // Names of the robot's active errors and of the errors that ended the last motion.
     virtual void errors(std::vector<std::string>& current, std::vector<std::string>& last_motion) const = 0;

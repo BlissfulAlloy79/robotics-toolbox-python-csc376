@@ -27,6 +27,7 @@ pybind11_add_module(_control MODULE
     src/motion_generator.cpp
     src/sim_backend.cpp
     src/trajectory.cpp
+    src/twist_follower.cpp
 )
 target_include_directories(_control PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(_control PRIVATE Threads::Threads)

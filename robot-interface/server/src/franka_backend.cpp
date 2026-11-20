@@ -16,6 +16,8 @@ namespace csc376_franky
 namespace
 {
 
+constexpr std::array<double, 16> kIdentity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
 // franka::Errors converts to ["name", "name"]; split that back into names.
 std::vector<std::string> errorNames(const franka::Errors& errors)
 {
@@ -46,6 +48,7 @@ Measured toMeasured(const franka::RobotState& state)
     m.tau_J = state.tau_J;
     m.tau_ext_hat_filtered = state.tau_ext_hat_filtered;
     m.O_T_EE = state.O_T_EE;
+    m.F_T_EE = state.F_T_EE;
     m.O_F_ext_hat_K = state.O_F_ext_hat_K;
     m.elbow = state.elbow;
     m.robot_mode = static_cast<int>(state.robot_mode);
@@ -190,6 +193,43 @@ public:
         {
             throw BackendControlError(e.what());
         }
+    }
+
+    void controlJointVelocities(const ControlCallback& callback) override
+    {
+        requireConnection();
+        configure();
+        try
+        {
+            robot_->control(
+                [&](const franka::RobotState& state, franka::Duration period) -> franka::JointVelocities {
+                    storeErrors(state);
+                    const Command command = callback(toMeasured(state), period.toSec());
+                    const franka::JointVelocities velocities(command.dq_d);
+                    return command.finished ? franka::MotionFinished(velocities) : velocities;
+                },
+                franka::ControllerMode::kJointImpedance, true, franka::kDefaultCutoffFrequency);
+        }
+        catch (const TrajectoryAbort&)
+        {
+            throw;
+        }
+        catch (const franka::NetworkException& e)
+        {
+            disconnect();
+            throw BackendNetworkError(e.what());
+        }
+        catch (const franka::Exception& e)
+        {
+            throw BackendControlError(e.what());
+        }
+    }
+
+    Jacobian endEffectorJacobian(const Measured& measured) const override
+    {
+        requireConnection();
+        // The stiffness frame, the last argument, does not move the end effector's frame.
+        return model_->zeroJacobian(franka::Frame::kEndEffector, measured.q, measured.F_T_EE, kIdentity);
     }
 
     void recover() override
